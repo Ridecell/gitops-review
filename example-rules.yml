@@ -1,0 +1,34 @@
+defaultReviewer: Ridecell/infrastructure
+
+rules:
+- filter:
+    kind: SummonPlatform
+    metadata.namespace: summon-dev
+  skipReview: true
+  autoMerge: true
+- filter:
+    kind: SummonPlatform
+    metadata.namespace: summon-qa
+  change:
+    spec.version: .*
+  skipReview: true
+  autoMerge: true
+- filter:
+    kind: SummonPlatform
+    metadata.namespace: summon-qa
+  reviewer: Ridecell/full-time-engineers
+  autoMerge: true
+- filter:
+    kind: SummonPlatform
+    metadata.namespace: summon-(uat|prod)
+    metadata.labels.follows-pcr: true
+  change:
+    spec.version: .*
+  reviewer: Ridecell/release-team
+- filter:
+    kind: SummonPlatform
+    metadata.name: mensa-prod
+    metadata.namespace: summon-prod
+  change:
+    spec.version: .*
+  reviewer: personalcomputer

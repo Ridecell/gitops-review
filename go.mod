@@ -11,4 +11,5 @@ require (
 	github.com/ramya-rao-a/go-outline v0.0.0-20181122025142-7182a932836a // indirect
 	github.com/sourcegraph/go-diff v0.5.1
 	github.com/stretchr/testify v1.4.0
+	gopkg.in/yaml.v2 v2.2.2
 )
