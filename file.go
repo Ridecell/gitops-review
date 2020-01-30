@@ -104,13 +104,13 @@ func ParseDiff(diffData []byte, owner, repo, headSHA, baseSHA string) ([]*review
 
 func (f *reviewableFile) FetchContent(client *github.Client) error {
 	if f.head != nil {
-		err := f.head.FetchContet(client, f.owner, f.repo)
+		err := f.head.FetchContent(client, f.owner, f.repo)
 		if err != nil {
 			return errors.Wrap(err, "error fetching head content")
 		}
 	}
 	if f.base != nil {
-		err := f.base.FetchContet(client, f.owner, f.repo)
+		err := f.base.FetchContent(client, f.owner, f.repo)
 		if err != nil {
 			return errors.Wrap(err, "error fetching base content")
 		}
@@ -118,7 +118,7 @@ func (f *reviewableFile) FetchContent(client *github.Client) error {
 	return nil
 }
 
-func (c *reviewableContent) FetchContet(client *github.Client, owner, repo string) error {
+func (c *reviewableContent) FetchContent(client *github.Client, owner, repo string) error {
 	content, err := fetchGithubFile(client, owner, repo, c.path, c.sha)
 	if err != nil {
 		return err
