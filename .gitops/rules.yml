@@ -1,0 +1,19 @@
+defaultReviewer: Ridecell/infrastructure
+rules:
+- filter:
+    test: true
+    name: testOne
+  skipReview: true
+  autoMerge: false
+- filter:
+    test: false
+    name: testTwo
+  change:
+    map.version: .*
+  skipReview: true
+  autoMerge: true
+- filter:
+    test: false
+    name: testTwo
+  skipReview: false
+  autoMerge: false

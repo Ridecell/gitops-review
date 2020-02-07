@@ -1,0 +1,7 @@
+name: testOne
+test: true
+---
+name: testTwo
+test: false
+map:
+  version: first
