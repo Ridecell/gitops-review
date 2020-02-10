@@ -1,4 +1,4 @@
-defaultReviewer: Ridecell/infrastructure
+defaultReviewer: Ridecell/devops
 rules:
 - filter:
     test: true
