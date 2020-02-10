@@ -4,4 +4,4 @@ test: true
 name: testTwo
 test: false
 map:
-  version: 2
+  version: 1
