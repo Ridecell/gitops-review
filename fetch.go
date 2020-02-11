@@ -10,6 +10,9 @@ import (
 	"github.com/pkg/errors"
 )
 
+// ConfigFilePath is the path to rules file.
+const RulesFilePath = "/.gitops/rules.yml"
+
 // Global LRU cache of recently accessed files to make Github less mad at us.
 var githubCache *lru.TwoQueueCache
 
@@ -42,4 +45,15 @@ func fetchGithubFile(client *github.Client, owner, repo, path, sha string) ([]by
 	}
 
 	return content.Bytes(), nil
+}
+
+func fetchRulesFile(client *github.Client, owner, repo string) ([]byte, error) {
+	// Enforce master branch rules over PR base
+	// Not all repos use master as the main branch, consider changing this later.
+	masterBranch, _, err := client.Repositories.GetBranch(context.Background(), owner, repo, "master")
+	if err != nil {
+		return nil, err
+	}
+
+	return fetchGithubFile(client, owner, repo, RulesFilePath, *masterBranch.Commit.SHA)
 }

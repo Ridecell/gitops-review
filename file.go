@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 
@@ -14,7 +15,7 @@ type reviewableContent struct {
 	path    string
 	sha     string
 	content []byte
-	keys    map[string]string
+	keys    []map[string]string
 }
 
 type reviewableFile struct {
@@ -28,7 +29,7 @@ type reviewableFile struct {
 var yamlPathRegexp *regexp.Regexp
 
 func init() {
-	yamlPathRegexp = regexp.MustCompile(`\.yam?l$`)
+	yamlPathRegexp = regexp.MustCompile(`\.ya?ml$`)
 }
 
 // Visitor function for expandYamlFile.
@@ -63,15 +64,19 @@ func expandYamlFileVisit(keys map[string]string, prefix string, obj interface{})
 }
 
 // Convert
-func expandYamlFile(content []byte) (map[string]string, error) {
+func expandYamlFile(content []byte) ([]map[string]string, error) {
+	r := bytes.NewReader(content)
+	dec := yaml.NewDecoder(r)
+
+	allKeys := []map[string]string{}
 	data := map[interface{}]interface{}{}
-	err := yaml.Unmarshal(content, &data)
-	if err != nil {
-		return nil, errors.Wrap(err, "error parsing YAML content")
+
+	for dec.Decode(&data) == nil {
+		keys := map[string]string{}
+		expandYamlFileVisit(keys, "", data)
+		allKeys = append(allKeys, keys)
 	}
-	keys := map[string]string{}
-	expandYamlFileVisit(keys, "", data)
-	return keys, nil
+	return allKeys, nil
 }
 
 func ParseDiff(diffData []byte, owner, repo, headSHA, baseSHA string) ([]*reviewableFile, error) {
@@ -87,13 +92,13 @@ func ParseDiff(diffData []byte, owner, repo, headSHA, baseSHA string) ([]*review
 		}
 		if diff.NewName != "/dev/null" {
 			file.head = &reviewableContent{
-				path: diff.NewName,
+				path: diff.NewName[1:],
 				sha:  headSHA,
 			}
 		}
 		if diff.OrigName != "/dev/null" {
 			file.base = &reviewableContent{
-				path: diff.OrigName,
+				path: diff.OrigName[1:],
 				sha:  baseSHA,
 			}
 		}

@@ -1,1 +1,5 @@
-conf/
+conf/*
+# Keep the conf dir but not the contents
+!conf/.gitkeep
+
+.envrc
