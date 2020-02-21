@@ -12,18 +12,43 @@ import (
 )
 
 type reviewableContent struct {
-	path    string
-	sha     string
-	content []byte
-	keys    []map[string]string
+	name    string
+	keys    map[string]string
+	diff    map[string]valueDiff
 }
 
 type reviewableFile struct {
-	owner string
-	repo  string
-	head  *reviewableContent
-	base  *reviewableContent
+	path string
+	headPath string
+	basePath string
+	content []byte
+	// blob "name" -> content
+	blobs map[string]*reviewableContent
+
+	// For fetching.
+	owner     string
+	repo      string
+	sha string
 }
+
+type reviewableVersion struct {
+	sha       string
+	// path -> reviewableFile
+	files map[string]*reviewableFile
+}
+
+type valueDiff struct {
+	head *string
+	base *string
+}
+
+type reviewablePatch struct {
+	owner     string
+	repo      string
+	head reviewableVersion
+	base reviewableVersion
+}
+
 
 // Paths which are probably YAML.
 var yamlPathRegexp *regexp.Regexp
@@ -79,56 +104,71 @@ func expandYamlFile(content []byte) ([]map[string]string, error) {
 	return allKeys, nil
 }
 
-func ParseDiff(diffData []byte, owner, repo, headSHA, baseSHA string) ([]*reviewableFile, error) {
+func ParseDiff(diffData []byte, owner, repo, headSHA, baseSHA string) (*reviewablePatch, error) {
 	diffs, err := diff.ParseMultiFileDiff(diffData)
 	if err != nil {
 		return nil, errors.Wrap(err, "error parsing diff")
 	}
-	files := []*reviewableFile{}
+	review := &reviewablePatch{owner: owner, repo: repo}
+	review.head.sha = headSHA
+	review.base.sha = baseSHA
+
 	for _, diff := range diffs {
-		file := &reviewableFile{
-			owner: owner,
-			repo:  repo,
-		}
+		// [1:] to trim off the a or b
+		headPath := diff.NewName[1:]
+		basePath := diff.OrigName[1:]
 		if diff.NewName != "/dev/null" {
-			file.head = &reviewableContent{
-				path: diff.NewName[1:],
-				sha:  headSHA,
+			review.head.files[headPath] = &reviewableContent{
+				path: headPath,
+				headPath: headPath,
+				basePath: basePath,
+				sha: headSHA,
+				owner: owner,
+				repo, repo,
 			}
 		}
 		if diff.OrigName != "/dev/null" {
-			file.base = &reviewableContent{
-				path: diff.OrigName[1:],
-				sha:  baseSHA,
+			review.base.files[basePath] = &reviewableContent{
+				path: basePath,
+				headPath: headPath,
+				basePath: basePath,
+				sha: baseSHA,
+				owner: owner,
+				repo, repo,
 			}
 		}
-		files = append(files, file)
 	}
-	return files, nil
+	return review, nil
 }
 
 func (f *reviewableFile) FetchContent(client *github.Client) error {
-	if f.head != nil {
-		err := f.head.FetchContent(client, f.owner, f.repo)
-		if err != nil {
-			return errors.Wrap(err, "error fetching head content")
-		}
+	content, err := fetchGithubFile(client, f.owner, f.repo, f.path, f.sha)
+	if err != nil {
+		return err
 	}
-	if f.base != nil {
-		err := f.base.FetchContent(client, f.owner, f.repo)
+	c.content = content
+	return nil
+}
+
+func (v *reviewableVersion) FetchContent(client *github.Client) error {
+	for _, file := range v.files {
+		err := file.FetchContent(client)
 		if err != nil {
-			return errors.Wrap(err, "error fetching base content")
+			return errors.Wrapf("error fetching content for %s", file.path)
 		}
 	}
 	return nil
 }
 
-func (c *reviewableContent) FetchContent(client *github.Client, owner, repo string) error {
-	content, err := fetchGithubFile(client, owner, repo, c.path, c.sha)
+func (p *reviewablePatch) FetchContent(client *github.Client) error {
+	err := p.head.FetchContent(client)
 	if err != nil {
-		return err
+		return errors.Wrap("error fetching head content")
 	}
-	c.content = content
+	err = p.base.FetchContent(client)
+	if err != nil {
+		return errors.Wrap("error fetching base content")
+	}
 	return nil
 }
 
