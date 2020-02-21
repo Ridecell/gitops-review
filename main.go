@@ -7,12 +7,12 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"regexp"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/bradleyfalzon/ghinstallation"
 	"github.com/google/go-github/v28/github"
-	"github.com/sourcegraph/go-diff/diff"
 )
 
 // NB: This whole thing is very single-task. If we add more to it, probably time to
@@ -21,79 +21,12 @@ import (
 var appID int
 var webhookSecret []byte
 
-// Check if the diff matches the rules for auto-approve (QA or Dev change, only changing `version`).
-func diffOkayForAutoApprove(diffData string) (bool, error) {
-	diffs, err := diff.ParseMultiFileDiff([]byte(diffData))
-	if err != nil {
-		return false, err
-	}
-	// Must be only 1 file.
-	if len(diffs) != 1 {
-		log.Printf("[autoapprove] Rejecting because not exactly 1 diff: %v", len(diffs))
-		return false, nil
-	}
-	diff := diffs[0]
-	// Must be a dev or qa folder.
-	pathRE := regexp.MustCompile(`^a/\w+-(dev|qa)/\w+\.yml$`)
-	if !pathRE.MatchString(diff.OrigName) {
-		log.Printf("[autoapprove] Rejecting because OrigName does not match: %#v", diff.OrigName)
-		return false, nil
-	}
-	// Must have exactly 1 hunk.
-	if len(diff.Hunks) != 1 {
-		log.Printf("[autoapprove] Rejecting because not exactly 1 hunk: %v", len(diff.Hunks))
-		return false, nil
-	}
-	hunk := diff.Hunks[0]
-	// Must change only version field.
-	// First check + lines, should be exactly one, starting with `+  version:`.
-	plusRE := regexp.MustCompile(`(?m:^\+.*$)`)
-	plusLines := plusRE.FindAll(hunk.Body, -1)
-	if len(plusLines) != 1 {
-		log.Printf("[autoapprove] Rejecting because not exactly 1 plus lines: %v", len(plusLines))
-		return false, nil
-	}
-	lineRE := regexp.MustCompile(`^[+-]\s+version:`)
-	if !lineRE.Match(plusLines[0]) {
-		log.Printf("[autoapprove] Rejecting because plus line does not match: %s", plusLines[0])
-		return false, nil
-	}
-	// Then check minus lines.
-	minusRE := regexp.MustCompile(`(?m:^-.*$)`)
-	minusLines := minusRE.FindAll(hunk.Body, -1)
-	if len(minusLines) != 1 {
-		log.Printf("[autoapprove] Rejecting because not exactly 1 minus lines: %v", len(minusLines))
-		return false, nil
-	}
-	if !lineRE.Match(minusLines[0]) {
-		log.Printf("[autoapprove] Rejecting because minus line does not match: %s", minusLines[0])
-		return false, nil
-	}
-	// Should be good.
-	return true, nil
-}
-
-func approvePullRequest(client *github.Client, event *github.PullRequestEvent) error {
-	reviews, _, err := client.PullRequests.ListReviews(context.Background(), *event.Organization.Login, *event.Repo.Name, *event.PullRequest.Number, nil)
-	if err != nil {
-		return err
-	}
-	if len(reviews) != 0 {
-		// TODO More here to check if the PR is already approved.
-		return nil
-	}
-	approvalMessage := "Automatically approving deploy"
-	approvalEvent := "APPROVE"
-	approval := &github.PullRequestReviewRequest{
-		CommitID: event.PullRequest.Head.SHA,
-		Body:     &approvalMessage,
-		Event:    &approvalEvent,
-	}
-	_, _, err = client.PullRequests.CreateReview(context.Background(), *event.Organization.Login, *event.Repo.Name, *event.PullRequest.Number, approval)
-	if err != nil {
-		return err
-	}
-	return nil
+type PullRequestEvent struct {
+	PullRequest  *github.PullRequest
+	Action       *string
+	Installation *github.Installation
+	Organization *github.Organization
+	Repo         *github.Repository
 }
 
 func getClient(installation *github.Installation) (*github.Client, error) {
@@ -105,10 +38,10 @@ func getClient(installation *github.Installation) (*github.Client, error) {
 	return client, nil
 }
 
-func handlePullRequestEvent(event *github.PullRequestEvent) error {
+func handlePullRequestEvent(event *PullRequestEvent) error {
 	log.Printf("Checking %s", *event.PullRequest.URL)
 
-	if *event.Action != "opened" && *event.Action != "synchronized" {
+	if *event.Action != "opened" && *event.Action != "synchronize" && *event.Action != "submitted" && *event.Action != "dismissed" {
 		log.Printf("Ignoring PR event type %s", *event.Action)
 		return nil
 	}
@@ -118,23 +51,122 @@ func handlePullRequestEvent(event *github.PullRequestEvent) error {
 		return err
 	}
 
+	rulesFile, err := fetchRulesFile(client, *event.Organization.Login, *event.Repo.Name)
+	if err != nil {
+		return err
+	}
+
+	rules, err := ParseRules(rulesFile)
+	if err != nil {
+		return err
+	}
+
 	//  GetRaw(ctx context.Context, owner string, repo string, number int, opt RawOptions
 	diffData, _, err := client.PullRequests.GetRaw(context.Background(), *event.Organization.Login, *event.Repo.Name, *event.PullRequest.Number, github.RawOptions{Type: github.Diff})
 	if err != nil {
 		return err
 	}
-	okayToApprove, err := diffOkayForAutoApprove(diffData)
+
+	reviewableFiles, err := ParseDiff([]byte(diffData), *event.Organization.Login, *event.Repo.Name, *event.PullRequest.Head.SHA, *event.PullRequest.Base.SHA)
 	if err != nil {
 		return err
 	}
-	if okayToApprove {
-		log.Printf("Approving %s", *event.PullRequest.URL)
-		err = approvePullRequest(client, event)
+
+	// Restrcture
+	requiredRules := Rules{
+		DefaultReviewer: rules.DefaultReviewer,
+	}
+	for _, reviewableFile := range reviewableFiles {
+		err = reviewableFile.FetchContent(client)
 		if err != nil {
 			return err
 		}
+
+		err = reviewableFile.ParseContent()
+		if err != nil {
+			return err
+		}
+
+		// Match the rules to the file.
+		requiredRules.Items = append(requiredRules.Items, rules.MatchRules(*reviewableFile)...)
 	}
 
+	// Check if the checks should be pass/failed here
+	pullRequestReviews, _, err := client.PullRequests.ListReviews(context.Background(), *event.Organization.Login, *event.Repo.Name, *event.PullRequest.Number, &github.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Determine whether our rule conditions have been satisfied or not.
+	unsatisfiedRules, autoMerge, skipReview, err := requiredRules.GetRemainingActions(client, pullRequestReviews)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Automerge: %#v\nSkipReview: %#v\n", autoMerge, skipReview)
+
+	checkConclusion := "success"
+	if len(unsatisfiedRules) > 0 {
+		checkConclusion = "action_required"
+	}
+
+	// Snag our check if it exists
+	checkName := "gitops-review"
+	checkRuns, _, err := client.Checks.ListCheckRunsForRef(context.Background(), *event.Organization.Login, *event.Repo.Name, *event.PullRequest.Head.SHA, &github.ListCheckRunsOptions{CheckName: &checkName})
+	if err != nil {
+		return err
+	}
+
+	var requiredReviewers []string
+	for _, unsatisfiedRule := range unsatisfiedRules {
+		requiredReviewers = append(requiredReviewers, unsatisfiedRule.Reviewer)
+	}
+
+	checkStatus := "completed"
+
+	checkRunOutputTitle := "gitops-review"
+	checkSummary := "Required reviewers"
+	checkRunOutputText := fmt.Sprintf("%s\n", strings.Join(requiredReviewers, ", "))
+
+	// If there are no check runs attached to this commit create one.
+	if checkRuns.Total == nil || *checkRuns.Total == 0 {
+		checkRunOpts := github.CreateCheckRunOptions{
+			Name:        checkName,
+			Status:      &checkStatus,
+			Conclusion:  &checkConclusion,
+			CompletedAt: &github.Timestamp{Time: time.Now()},
+			HeadSHA:     *event.PullRequest.Head.SHA,
+			Output: &github.CheckRunOutput{
+				Title:   &checkRunOutputTitle,
+				Summary: &checkSummary,
+				Text:    &checkRunOutputText,
+			},
+		}
+		_, _, err := client.Checks.CreateCheckRun(context.Background(), *event.Organization.Login, *event.Repo.Name, checkRunOpts)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	checkRunForRef := checkRuns.CheckRuns[0]
+	checkRunOpts := github.UpdateCheckRunOptions{
+		Name:        *checkRunForRef.Name,
+		HeadSHA:     event.PullRequest.Head.SHA,
+		Status:      &checkStatus,
+		Conclusion:  &checkConclusion,
+		CompletedAt: &github.Timestamp{Time: time.Now()},
+		Output: &github.CheckRunOutput{
+			Title:   &checkRunOutputTitle,
+			Summary: &checkSummary,
+			Text:    &checkRunOutputText,
+		},
+	}
+
+	_, _, err = client.Checks.UpdateCheckRun(context.Background(), *event.Organization.Login, *event.Repo.Name, *checkRunForRef.ID, checkRunOpts)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -147,9 +179,12 @@ func handleWebhookInternal(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+
 	switch event := event.(type) {
 	case *github.PullRequestEvent:
-		return handlePullRequestEvent(event)
+		return handlePullRequestEvent(&PullRequestEvent{PullRequest: event.PullRequest, Action: event.Action, Installation: event.Installation, Organization: event.Organization, Repo: event.Repo})
+	case *github.PullRequestReviewEvent:
+		return handlePullRequestEvent(&PullRequestEvent{PullRequest: event.PullRequest, Action: event.Action, Installation: event.Installation, Organization: event.Organization, Repo: event.Repo})
 	default:
 		return fmt.Errorf("Unknown webhook type: %s", github.WebHookType(r))
 	}
@@ -166,15 +201,6 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// keyData, err := ioutil.ReadFile("conf/private-key.pem")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// block, _ := pem.Decode([]byte(keyData))
-	// key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	// if err != nil {
-	// 	panic(err)
-	// }
 
 	appIDBytes, err := ioutil.ReadFile("conf/app-id")
 	if err != nil {
@@ -189,37 +215,6 @@ func main() {
 		log.Fatal(err)
 	}
 	webhookSecret = bytes.TrimSpace(webhookSecretBytes)
-
-	// // Create a new token object, specifying signing method and the claims
-	// // you would like it to contain.
-	// now := time.Now().Unix()
-	// token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-	// 	"iss": appID,
-	// 	"iat": now,
-	// 	"exp": now + 60,
-	// })
-
-	// // Sign and get the complete encoded token as a string using the secret
-	// tokenString, err := token.SignedString(key)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// fmt.Println(tokenString)
-	// atr, err := ghinstallation.NewAppsTransportKeyFromFile(http.DefaultTransport, appID, "conf/private-key.pem")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	// itr, err := ghinstallation.NewKeyFromFile(http.DefaultTransport, appID, 0, "conf/private-key.pem")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	// Use installation transport with github.com/google/go-github
-	// client := github.NewClient(&http.Client{Transport: atr})
-	// l, _, err := client.Apps.ListInstallations(context.Background(), nil)
-	// fmt.Printf("%#v %s\n", l[0], err)
 
 	http.HandleFunc("/webhook", handleWebhook)
 	log.Fatal(http.ListenAndServe(":8000", nil))
